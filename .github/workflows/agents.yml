@@ -85,7 +85,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install the agents
-        uses: germanndarian/agents-ci/.github/actions/agents@main
+        uses: germanndarian/agents-ci/.github/actions/agents@v1
 
       - name: Run the ${{ matrix.agent }}
         id: agent

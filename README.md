@@ -28,13 +28,19 @@ The agents and everything else live in a private repo. This one is public only b
        types: [opened, synchronize, reopened, ready_for_review]
    jobs:
      agents:
-       uses: germanndarian/agents-ci/.github/workflows/agents.yml@main
+       uses: germanndarian/agents-ci/.github/workflows/agents.yml@v1
        permissions:
          contents: read
          pull-requests: write
        secrets:
          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
    ```
+
+## Versions
+
+Repos use `@v1`, a branch that moves only when I release it, so a push to `main` here changes no repo's review.
+- **Changes land on `main` first:** new agents arrive after every commit in the private repo.
+- **Releasing:** `release-ci.sh` in the private repo fast-forwards `v1` to `main`. From then on, every repo's next review uses it.
 
 ## What's here
 
