@@ -95,12 +95,23 @@ jobs:
             --disallowedTools "Edit,Write,NotebookEdit,Agent(legal),Agent(github)"
             --json-schema '{"type":"object","properties":{"comment":{"type":"string"}},"required":["comment"]}'
 
+      - name: Say why the review failed
+        if: failure() && steps.agents.outputs.execution_file != ''
+        env:
+          EXECUTION_FILE: ${{ steps.agents.outputs.execution_file }}
+        run: |
+          # Only Claude's last message, which on a failure is the error (sign-in, limits).
+          # Nothing else is printed: a public repo's logs are public.
+          jq -r '[.[] | select(.type == "result")] | last | .result // "No message"' "$EXECUTION_FILE" | head -c 500
+
       - name: Post or update the comment
         if: steps.changes.outputs.code == 'true' && steps.agents.outputs.structured_output != ''
         env:
-          COMMENT: ${{ fromJSON(steps.agents.outputs.structured_output).comment }}
+          # Parsed in the script: an expression here would be evaluated even when the step is skipped.
+          OUTPUT: ${{ steps.agents.outputs.structured_output }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          COMMENT="$(jq -r '.comment' <<<"$OUTPUT")"
           # The marker finds the comment again, so each push updates it instead of adding one.
           marker='<!-- agents-review -->'
           body="$marker
