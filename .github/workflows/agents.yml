@@ -51,6 +51,8 @@ jobs:
           fi
 
   review:
+    # Checks read "agents / reviewer", "agents / tester", …
+    name: ${{ matrix.agent }}
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
@@ -158,14 +160,14 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           section() { # section <heading> <agent>
-            printf '### %s\n\n' "$1"
+            printf '## %s\n\n' "$1"
             if [ -f "reports/report-$2/report.md" ]; then cat "reports/report-$2/report.md"; else echo "The $2 didn't run."; fi
             printf '\n\n'
           }
           # The marker finds the comment again, so each push updates it instead of adding one.
           marker='<!-- agents-review -->'
           body="$(
-            printf '%s\n## Agents'"'"' review\n\n' "$marker"
+            printf '%s\n# Agents'"'"' review\n\n' "$marker"
             section Reviewer reviewer
             section Tester tester
             section Critic critic
