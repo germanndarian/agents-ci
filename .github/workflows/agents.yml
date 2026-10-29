@@ -1,11 +1,14 @@
 # The agents' review of a pull request. The reviewer, tester, critic and business analyst
-# read the PR on Sonnet, and one comment on the PR sums up what they found; a new push
-# updates the same comment. Repos call this from their own .github/workflows/agents.yml
-# (see the README). The legal agent never runs here.
+# each read the PR on Sonnet in a job of their own, side by side, and one comment on the PR
+# puts their reports together; a new push updates the same comment. Repos call this from
+# their own .github/workflows/agents.yml (see the README). The legal agent never runs here.
 #
 # Claude signs in with the calling repo's CLAUDE_CODE_OAUTH_TOKEN secret from
 # `claude setup-token`, so it runs on my subscription, never an API key. Claude only gets
-# tools that read; the last step posts the comment with the workflow's own token.
+# tools that read; the last job posts the comment with the workflow's own token.
+#
+# Each agent runs as the session itself (`--agent`) rather than as a subagent of a
+# coordinating session: in CI a coordinator answered before its subagents had reported.
 name: Agents
 
 on:
@@ -14,21 +17,23 @@ on:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
 
+env:
+  PR: ${{ github.event.pull_request.number }}
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
-  review:
+  changes:
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write
-    # A new push to the PR cancels the review still running for the one before.
+      pull-requests: read
+    # Every job has its own group, so a new push cancels the same job of the run before.
     concurrency:
-      group: agents-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: agents-${{ github.repository }}-${{ github.event.pull_request.number }}-changes
       cancel-in-progress: true
-    env:
-      PR: ${{ github.event.pull_request.number }}
-      GH_TOKEN: ${{ github.token }}
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
     steps:
       - name: See what changed
         id: changes
@@ -45,19 +50,44 @@ jobs:
             echo "Only docs changed, so the agents skip this PR."
           fi
 
+  review:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    concurrency:
+      group: agents-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ matrix.agent }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: reviewer
+            task: Review the whole pull request.
+          - agent: tester
+            task: >-
+              Don't write, edit or run tests or builds here. From the diff and the existing tests,
+              say what the change tests, what it leaves untested, and which tests to add.
+              `gh pr checks ${{ github.event.pull_request.number }}` shows how the PR's other checks did.
+          - agent: critic
+            task: Say what's weak or risky in this pull request.
+          - agent: business-analyst
+            task: Say whether this change is worth it, who it's for, and what's missing.
+    steps:
       - name: Check out the pull request
-        if: steps.changes.outputs.code == 'true'
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Install the agents
-        if: steps.changes.outputs.code == 'true'
         uses: germanndarian/agents-ci/.github/actions/agents@main
 
-      - name: Review
-        id: agents
-        if: steps.changes.outputs.code == 'true'
+      - name: Run the ${{ matrix.agent }}
+        id: agent
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -69,57 +99,79 @@ jobs:
             `gh pr diff ${{ github.event.pull_request.number }}` shows the change, and the code is
             checked out in the working directory.
 
-            Start these four agents at the same time, then wait for all four reports:
-            - reviewer: review the whole pull request.
-            - tester: don't write, edit or run tests or builds here. From the diff and the existing
-              tests, say what the change tests, what it leaves untested, and which tests to add.
-              `gh pr checks ${{ github.event.pull_request.number }}` shows how the PR's other checks did.
-            - critic: what's weak or risky in this pull request.
-            - business-analyst: whether this change is worth it, who it's for, and what's missing.
+            This runs in CI: nobody can answer questions, and nothing may be changed, committed
+            or pushed.
 
-            Tell each one the pull request number and how to see the change. This runs in CI:
-            nobody can answer questions, and nothing may be changed, committed or pushed.
-
-            Answer with the comment for the pull request, in Markdown, with these four headings
-            in this order and nothing before the first one:
-            ### Reviewer
-            ### Tester
-            ### Critic
-            ### Business analyst
-            Under each, put that agent's report exactly as it gave it, formatting included. Don't
-            add a review of your own. If an agent failed, say so under its heading.
+            Your task: ${{ matrix.task }}
+            Answer with your report only, in Markdown.
+          # --agent runs the session as that agent. With it, Claude Code ignores --json-schema,
+          # so the report is read from the run's last message instead.
           claude_args: >-
+            --agent ${{ matrix.agent }}
             --model sonnet
-            --max-turns 60
-            --allowedTools "Read,Grep,Glob,Agent,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
-            --disallowedTools "Edit,Write,NotebookEdit,Agent(legal),Agent(github)"
-            --json-schema '{"type":"object","properties":{"comment":{"type":"string"}},"required":["comment"]}'
+            --max-turns 40
+            --allowedTools "Read,Grep,Glob,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --disallowedTools "Edit,Write,NotebookEdit,Agent"
 
-      - name: Say why the review failed
-        if: failure() && steps.agents.outputs.execution_file != ''
+      - name: Save the report
+        if: always()
         env:
-          EXECUTION_FILE: ${{ steps.agents.outputs.execution_file }}
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          AGENT: ${{ matrix.agent }}
         run: |
-          # Only Claude's last message, which on a failure is the error (sign-in, limits).
-          # Nothing else is printed: a public repo's logs are public.
-          jq -r '[.[] | select(.type == "result")] | last | .result // "No message"' "$EXECUTION_FILE" | head -c 500
+          mkdir -p report
+          last='[.[] | select(.type == "result")] | last'
+          if [ -f "$EXECUTION_FILE" ] && [ "$(jq -r "$last | .is_error" "$EXECUTION_FILE")" = false ]; then
+            jq -r "$last | .result" "$EXECUTION_FILE" >report/report.md
+          else
+            # Only the error goes into the log and the comment: a public repo's logs are public.
+            error="$([ -f "$EXECUTION_FILE" ] && jq -r "$last | .result // empty" "$EXECUTION_FILE" | head -c 300)"
+            echo "The $AGENT didn't finish${error:+: $error}" | tee report/report.md
+          fi
+
+      - name: Keep the report for the comment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.agent }}
+          path: report/report.md
+          retention-days: 1
+
+  comment:
+    needs: [changes, review]
+    if: always() && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    concurrency:
+      group: agents-${{ github.repository }}-${{ github.event.pull_request.number }}-comment
+      cancel-in-progress: true
+    steps:
+      - name: Collect the reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: report-*
+          path: reports
 
       - name: Post or update the comment
-        if: steps.changes.outputs.code == 'true' && steps.agents.outputs.structured_output != ''
         env:
-          # Parsed in the script: an expression here would be evaluated even when the step is skipped.
-          OUTPUT: ${{ steps.agents.outputs.structured_output }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          COMMENT="$(jq -r '.comment' <<<"$OUTPUT")"
+          section() { # section <heading> <agent>
+            printf '### %s\n\n' "$1"
+            if [ -f "reports/report-$2/report.md" ]; then cat "reports/report-$2/report.md"; else echo "The $2 didn't run."; fi
+            printf '\n\n'
+          }
           # The marker finds the comment again, so each push updates it instead of adding one.
           marker='<!-- agents-review -->'
-          body="$marker
-          ## Agents' review
-
-          $COMMENT
-
-          <sub>${HEAD_SHA::7} · reviewer, tester, critic and business analyst on Sonnet</sub>"
+          body="$(
+            printf '%s\n## Agents'"'"' review\n\n' "$marker"
+            section Reviewer reviewer
+            section Tester tester
+            section Critic critic
+            section "Business analyst" business-analyst
+            printf '<sub>%s · reviewer, tester, critic and business analyst on Sonnet</sub>\n' "${HEAD_SHA::7}"
+          )"
           id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
             --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)"
           if [ -n "$id" ]; then
