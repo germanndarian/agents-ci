@@ -1,0 +1,119 @@
+# The agents' review of a pull request. The reviewer, tester, critic and business analyst
+# read the PR on Sonnet, and one comment on the PR sums up what they found; a new push
+# updates the same comment. Repos call this from their own .github/workflows/agents.yml
+# (see the README). The legal agent never runs here.
+#
+# Claude signs in with the calling repo's CLAUDE_CODE_OAUTH_TOKEN secret from
+# `claude setup-token`, so it runs on my subscription, never an API key. Claude only gets
+# tools that read; the last step posts the comment with the workflow's own token.
+name: Agents
+
+on:
+  workflow_call:
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  review:
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    # A new push to the PR cancels the review still running for the one before.
+    concurrency:
+      group: agents-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: See what changed
+        id: changes
+        run: |
+          files="$(gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only)"
+          echo "Changed files:"
+          echo "$files"
+          # Docs only (Markdown, text, images, docs/, LICENSE): nothing for the agents to review.
+          code="$(grep -Ev '\.(md|mdx|txt|png|jpe?g|gif|svg|webp)$|^docs/|(^|/)LICENSE$' <<<"$files" || true)"
+          if [ -n "$code" ]; then
+            echo "code=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "code=false" >>"$GITHUB_OUTPUT"
+            echo "Only docs changed, so the agents skip this PR."
+          fi
+
+      - name: Check out the pull request
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install the agents
+        if: steps.changes.outputs.code == 'true'
+        uses: germanndarian/agents-ci/.github/actions/agents@main
+
+      - name: Review
+        id: agents
+        if: steps.changes.outputs.code == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Pull request #${{ github.event.pull_request.number }} in ${{ github.repository }} goes from
+            ${{ github.event.pull_request.head.ref }} into ${{ github.event.pull_request.base.ref }}.
+            `gh pr view ${{ github.event.pull_request.number }}` shows its title and description,
+            `gh pr diff ${{ github.event.pull_request.number }}` shows the change, and the code is
+            checked out in the working directory.
+
+            Start these four agents at the same time, then wait for all four reports:
+            - reviewer: review the whole pull request.
+            - tester: don't write, edit or run tests or builds here. From the diff and the existing
+              tests, say what the change tests, what it leaves untested, and which tests to add.
+              `gh pr checks ${{ github.event.pull_request.number }}` shows how the PR's other checks did.
+            - critic: what's weak or risky in this pull request.
+            - business-analyst: whether this change is worth it, who it's for, and what's missing.
+
+            Tell each one the pull request number and how to see the change. This runs in CI:
+            nobody can answer questions, and nothing may be changed, committed or pushed.
+
+            Answer with the comment for the pull request, in Markdown, with these four headings
+            in this order and nothing before the first one:
+            ### Reviewer
+            ### Tester
+            ### Critic
+            ### Business analyst
+            Under each, put that agent's report exactly as it gave it, formatting included. Don't
+            add a review of your own. If an agent failed, say so under its heading.
+          claude_args: >-
+            --model sonnet
+            --max-turns 60
+            --allowedTools "Read,Grep,Glob,Agent,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --disallowedTools "Edit,Write,NotebookEdit,Agent(legal),Agent(github)"
+            --json-schema '{"type":"object","properties":{"comment":{"type":"string"}},"required":["comment"]}'
+
+      - name: Post or update the comment
+        if: steps.changes.outputs.code == 'true' && steps.agents.outputs.structured_output != ''
+        env:
+          COMMENT: ${{ fromJSON(steps.agents.outputs.structured_output).comment }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # The marker finds the comment again, so each push updates it instead of adding one.
+          marker='<!-- agents-review -->'
+          body="$marker
+          ## Agents' review
+
+          $COMMENT
+
+          <sub>${HEAD_SHA::7} · reviewer, tester, critic and business analyst on Sonnet</sub>"
+          id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n 1)"
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" >/dev/null
+            echo "Updated comment $id"
+          else
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
+          fi

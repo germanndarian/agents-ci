@@ -1,0 +1,10 @@
+name: Install the agents
+description: >-
+  Copies the shared agents from this repo into ~/.claude/agents on the runner, so Claude Code
+  finds them. The legal and GitHub agents stay behind, and the agents' local hooks are dropped.
+runs:
+  using: composite
+  steps:
+    - name: Copy the agents
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/install.sh"'
